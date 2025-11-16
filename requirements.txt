@@ -3,4 +3,4 @@ uvicorn[standard]==0.24.0
 gunicorn==21.2.0
 numpy==1.24.3
 pydantic==2.5.0
-tensorflow==2.14.0
+tflite-runtime==2.14.0
