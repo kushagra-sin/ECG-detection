@@ -1,12 +1,23 @@
+"""
+ECG Classification API with Label Reversal
+Uses TFLite Runtime (no full TensorFlow dependency)
+"""
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import numpy as np
-import tensorflow as tf
 from typing import List, Dict
 import logging
 import os
+
+# TFLite Runtime import
+try:
+    from tflite_runtime.interpreter import Interpreter
+except ImportError:
+    # Fallback for local testing with full TensorFlow
+    import tensorflow as tf
+    Interpreter = tf.lite.Interpreter
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +37,7 @@ app.add_middleware(
 # Global variables for model
 MODEL = None
 LABEL_CLASSES = None
-MODEL_PATH = "ecg_classifier_300hz.h5"
+MODEL_PATH = "ecg_classifier_300hz.tflite"
 LABEL_PATH = "label_classes.npy"
 
 # ============= REQUEST/RESPONSE MODELS =============
@@ -48,37 +59,55 @@ class ECGResponse(BaseModel):
 
 # ============= MODEL LOADING =============
 def load_model_and_labels():
-    """Load the trained model and label classes"""
+    """Load the TFLite model and label classes"""
     global MODEL, LABEL_CLASSES
     
     try:
-        # Try loading .h5 model first
-        if os.path.exists(MODEL_PATH):
-            logger.info(f"Loading model from {MODEL_PATH}")
-            MODEL = tf.keras.models.load_model(MODEL_PATH, compile=False)
-            MODEL.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-            logger.info("Model loaded successfully (H5 format)")
-        elif os.path.exists("ecg_classifier_300hz.tflite"):
-            # Fallback to TFLite
-            logger.info("Loading TFLite model")
-            interpreter = tf.lite.Interpreter(model_path="ecg_classifier_300hz.tflite")
-            interpreter.allocate_tensors()
-            MODEL = interpreter
-            logger.info("TFLite model loaded successfully")
-        else:
-            raise FileNotFoundError("No model file found (.h5 or .tflite)")
+        logger.info("="*70)
+        logger.info("LOADING ECG CLASSIFICATION MODEL")
+        logger.info("="*70)
+        
+        # Check current directory
+        logger.info(f"Current directory: {os.getcwd()}")
+        logger.info(f"Files in directory: {os.listdir('.')}")
+        
+        # Load TFLite model
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(
+                f"TFLite model not found: {MODEL_PATH}\n"
+                f"Please ensure 'ecg_classifier_300hz.tflite' is in the repository root."
+            )
+        
+        logger.info(f"Loading TFLite model from: {MODEL_PATH}")
+        MODEL = Interpreter(model_path=MODEL_PATH)
+        MODEL.allocate_tensors()
+        
+        # Get model details
+        input_details = MODEL.get_input_details()
+        output_details = MODEL.get_output_details()
+        
+        logger.info(f"✓ TFLite model loaded successfully!")
+        logger.info(f"  Input shape: {input_details[0]['shape']}")
+        logger.info(f"  Input dtype: {input_details[0]['dtype']}")
+        logger.info(f"  Output shape: {output_details[0]['shape']}")
         
         # Load label classes
         if os.path.exists(LABEL_PATH):
             LABEL_CLASSES = np.load(LABEL_PATH, allow_pickle=True)
-            logger.info(f"Loaded label classes: {LABEL_CLASSES}")
+            logger.info(f"✓ Loaded label classes: {LABEL_CLASSES.tolist()}")
         else:
             # Default labels if file not found
             LABEL_CLASSES = np.array(['Normal', 'Abnormal'])
-            logger.warning("Label file not found, using default labels")
+            logger.warning(f"⚠️  Label file not found, using default: {LABEL_CLASSES.tolist()}")
+        
+        logger.info("="*70)
+        logger.info("MODEL READY - Label Reversal ENABLED")
+        logger.info("="*70)
             
     except Exception as e:
-        logger.error(f"Error loading model: {e}")
+        logger.error(f"❌ Error loading model: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 # ============= LABEL REVERSAL LOGIC =============
@@ -129,9 +158,11 @@ def preprocess_signal(signal: List[float], target_length: int = 3000) -> np.ndar
         # Pad with zeros
         padding = target_length - len(signal_array)
         signal_array = np.pad(signal_array, (0, padding), mode='constant')
+        logger.info(f"Signal padded from {len(signal)} to {target_length}")
     elif len(signal_array) > target_length:
         # Truncate
         signal_array = signal_array[:target_length]
+        logger.info(f"Signal truncated from {len(signal)} to {target_length}")
     
     # Reshape for model: (1, timesteps, 1)
     signal_array = signal_array.reshape(1, target_length, 1)
@@ -140,26 +171,27 @@ def preprocess_signal(signal: List[float], target_length: int = 3000) -> np.ndar
 
 def predict_ecg(signal: List[float]) -> tuple:
     """
-    Make prediction on ECG signal
+    Make prediction on ECG signal using TFLite model
     
     Returns:
         Tuple of (prediction_label, confidence, probabilities_dict)
     """
     try:
-        # Preprocess
+        # Preprocess signal
         processed_signal = preprocess_signal(signal)
         
-        # Make prediction
-        if isinstance(MODEL, tf.lite.Interpreter):
-            # TFLite prediction
-            input_details = MODEL.get_input_details()
-            output_details = MODEL.get_output_details()
-            MODEL.set_tensor(input_details[0]['index'], processed_signal)
-            MODEL.invoke()
-            predictions = MODEL.get_tensor(output_details[0]['index'])[0]
-        else:
-            # Keras model prediction
-            predictions = MODEL.predict(processed_signal, verbose=0)[0]
+        # Get input and output details
+        input_details = MODEL.get_input_details()
+        output_details = MODEL.get_output_details()
+        
+        # Set input tensor
+        MODEL.set_tensor(input_details[0]['index'], processed_signal)
+        
+        # Run inference
+        MODEL.invoke()
+        
+        # Get output tensor
+        predictions = MODEL.get_tensor(output_details[0]['index'])[0]
         
         # Get prediction details
         predicted_idx = np.argmax(predictions)
@@ -172,20 +204,26 @@ def predict_ecg(signal: List[float]) -> tuple:
             probabilities[str(label)] = float(predictions[idx])
         
         logger.info(f"Raw model output - Label: {predicted_label}, Confidence: {confidence:.4f}")
+        logger.info(f"Raw probabilities: {probabilities}")
         
         return predicted_label, confidence, probabilities
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 # ============= API ENDPOINTS =============
 @app.on_event("startup")
 async def startup_event():
     """Load model on startup"""
-    logger.info("Starting ECG Classification API...")
+    logger.info("\n" + "="*70)
+    logger.info("STARTING ECG CLASSIFICATION API")
+    logger.info("="*70)
     load_model_and_labels()
-    logger.info("API ready!")
+    logger.info("✓ API READY TO ACCEPT REQUESTS")
+    logger.info("="*70 + "\n")
 
 @app.get("/")
 async def root():
@@ -195,17 +233,24 @@ async def root():
         "service": "ECG Classification API",
         "version": "1.0.0",
         "model_loaded": MODEL is not None,
-        "label_reversal": "ENABLED - Normal/Abnormal swapped"
+        "model_type": "TFLite",
+        "label_reversal": "ENABLED - Normal/Abnormal swapped",
+        "labels": LABEL_CLASSES.tolist() if LABEL_CLASSES is not None else None
     }
 
 @app.post("/predict_signal", response_model=ECGResponse)
 async def predict_signal(request: ECGSignalRequest):
     """
-    Main prediction endpoint
+    Main prediction endpoint - Accepts ECG signal and returns classification with REVERSED labels
     """
     try:
-        logger.info(f"Received prediction request from source: {request.source}")
-        logger.info(f"Signal length: {len(request.signal)}, Sample rate: {request.sample_rate}")
+        logger.info("\n" + "="*70)
+        logger.info(f"NEW PREDICTION REQUEST")
+        logger.info("="*70)
+        logger.info(f"Source: {request.source}")
+        logger.info(f"Signal length: {len(request.signal)} samples")
+        logger.info(f"Sample rate: {request.sample_rate} Hz")
+        logger.info(f"Duration: {request.duration}s")
         
         # Validate input
         if len(request.signal) == 0:
@@ -222,6 +267,10 @@ async def predict_signal(request: ECGSignalRequest):
             'original_min': float(np.min(signal_array)),
             'original_max': float(np.max(signal_array))
         }
+        
+        logger.info(f"Signal stats: mean={original_stats['original_mean']:.4f}, "
+                   f"std={original_stats['original_std']:.4f}, "
+                   f"range=[{original_stats['original_min']:.4f}, {original_stats['original_max']:.4f}]")
         
         # Make prediction (this returns RAW model output)
         raw_prediction, raw_confidence, raw_probabilities = predict_ecg(request.signal)
@@ -258,14 +307,16 @@ async def predict_signal(request: ECGSignalRequest):
             }
         )
         
-        logger.info(f"✓ Prediction complete: {corrected_prediction} ({corrected_confidence*100:.2f}%)")
+        logger.info("="*70)
+        logger.info(f"✓ PREDICTION COMPLETE: {corrected_prediction} ({corrected_confidence*100:.2f}%)")
+        logger.info("="*70 + "\n")
         
         return response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing request: {e}")
+        logger.error(f"❌ Error processing request: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
@@ -277,8 +328,34 @@ async def health_check():
         "status": "healthy",
         "model_loaded": MODEL is not None,
         "labels": LABEL_CLASSES.tolist() if LABEL_CLASSES is not None else None,
-        "model_type": "H5" if not isinstance(MODEL, tf.lite.Interpreter) else "TFLite"
+        "model_type": "TFLite",
+        "model_path": MODEL_PATH,
+        "model_exists": os.path.exists(MODEL_PATH),
+        "label_reversal": "enabled"
     }
+
+@app.get("/model-info")
+async def model_info():
+    """Get detailed model information"""
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    try:
+        input_details = MODEL.get_input_details()
+        output_details = MODEL.get_output_details()
+        
+        return {
+            "model_type": "TFLite",
+            "model_path": MODEL_PATH,
+            "input_shape": input_details[0]['shape'].tolist(),
+            "input_dtype": str(input_details[0]['dtype']),
+            "output_shape": output_details[0]['shape'].tolist(),
+            "output_dtype": str(output_details[0]['dtype']),
+            "labels": LABEL_CLASSES.tolist() if LABEL_CLASSES is not None else None,
+            "num_classes": len(LABEL_CLASSES) if LABEL_CLASSES is not None else 0
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting model info: {str(e)}")
 
 # ============= MAIN =============
 if __name__ == "__main__":
